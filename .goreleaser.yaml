@@ -1,0 +1,44 @@
+# GoReleaser builds the archives for .github/workflows/release.yml. The
+# workflow publishes them to ghcr.io with scripts/lfed-plugin-publish.sh.
+# Local check: `make release-snapshot`.
+version: 2
+
+project_name: lfed-monkeysay
+
+snapshot:
+  version_template: "0.0.0-SNAPSHOT-{{ .ShortCommit }}"
+
+builds:
+  - id: lfed-monkeysay
+    main: ./cmd/lfed-monkeysay
+    binary: lfed-monkeysay
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.Version={{ .Version }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: lfed-monkeysay
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - none*
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  disable: true
+
+release:
+  disable: true
