@@ -1,0 +1,122 @@
+name: Release
+
+# A vX.Y.Z tag runs this workflow. It builds the archives with GoReleaser,
+# publishes them to ghcr.io/lf-certification/lfed-cli-plugins/monkeysay as
+# an OCI artifact, signs the OCI index with cosign keyless and creates a
+# GitHub Release.
+#
+# Signer identity contract. The lfed host verifies each install against the
+# catalog entry lfed-cli/catalog/plugins/monkeysay.yaml:
+#   identity  https://github.com/LF-Certification/lfed-cli-plugin-monkeysay/.github/workflows/release.yml@refs/tags/v<version>
+#   issuer    https://token.actions.githubusercontent.com
+# You MUST NOT rename this file or change the tag format. Either change
+# breaks every install of a new release.
+#
+# Every `uses:` is pinned to a commit SHA. Dependabot updates the pins.
+# All setup actions run before the ghcr.io login.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions: {}
+
+env:
+  IMAGE_REPOSITORY: ghcr.io/lf-certification/lfed-cli-plugins/monkeysay
+
+jobs:
+  release:
+    name: Release ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # GitHub Release
+      packages: write # push to ghcr.io
+      id-token: write # cosign keyless signing
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require the tag commit on main
+        run: |
+          git fetch --no-tags origin main || git rev-parse --verify origin/main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "tag commit is not on main"; exit 1; }
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Install oras
+        uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1.2.4
+        with:
+          version: 1.3.0
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: v3.1.4
+
+      - name: Lint and test
+        run: make lint test
+
+      - name: Build archives
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6.4.0
+        with:
+          version: "~> v2"
+          args: release --clean
+
+      - name: Extract release notes
+        run: |
+          awk -v v="${GITHUB_REF_NAME#v}" '
+            $0 ~ "^## \\[" v "\\]" { on=1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > "${RUNNER_TEMP}/notes.md"
+          test -s "${RUNNER_TEMP}/notes.md" || { echo "no CHANGELOG section for ${GITHUB_REF_NAME}"; exit 1; }
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Writes index_digest to GITHUB_OUTPUT.
+      - name: Publish OCI artifact
+        id: publish
+        run: scripts/lfed-plugin-publish.sh dist "$IMAGE_REPOSITORY" "${GITHUB_REF_NAME#v}" "$GITHUB_SHA"
+
+      - name: Sign OCI index
+        env:
+          IMAGE: ${{ env.IMAGE_REPOSITORY }}@${{ steps.publish.outputs.index_digest }}
+        run: cosign sign --yes "$IMAGE"
+
+      # The same identity check as the lfed host.
+      - name: Verify OCI index signature
+        env:
+          IMAGE: ${{ env.IMAGE_REPOSITORY }}@${{ steps.publish.outputs.index_digest }}
+        run: |
+          cosign verify \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$IMAGE" > /dev/null
+
+      # Remove the ghcr.io write credential before more third-party code runs.
+      - name: Log out of ghcr.io
+        run: docker logout ghcr.io
+
+      # The OCI artifact is the installable release. The GitHub Release is
+      # the human-readable page per version.
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          name: lfed-monkeysay ${{ github.ref_name }}
+          body_path: ${{ runner.temp }}/notes.md
+          files: |
+            dist/*.tar.gz
+            dist/checksums.txt
+          fail_on_unmatched_files: true
